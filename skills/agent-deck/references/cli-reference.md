@@ -14,6 +14,7 @@ Complete reference for all agent-deck CLI commands.
 - [Profile Commands](#profile-commands)
 - [Remote Commands](#remote-commands)
 - [Conductor Commands](#conductor-commands)
+- [Shell Completions](#shell-completions)
 
 ## Global Options
 
@@ -475,6 +476,57 @@ agent-deck remote rename dev my-session new-name
 agent-deck remote update          # update all remotes
 agent-deck remote update dev      # update specific remote
 ```
+
+## Shell Completions
+
+### completions - Generate shell completion scripts
+
+```bash
+agent-deck completions <shell>
+```
+
+Generate shell completion scripts for Bash, ZSH, or Fish.
+
+Supported shells:
+- `bash` - Generate Bash completion script
+- `zsh` - Generate ZSH completion script
+- `fish` - Generate Fish completion script
+
+### Installation Examples
+
+**Bash:**
+```bash
+# System-wide (requires sudo)
+agent-deck completions bash | sudo tee /etc/bash_completion.d/agent-deck > /dev/null
+
+# User-level
+mkdir -p ~/.bash_completion.d
+agent-deck completions bash > ~/.bash_completion.d/agent-deck
+# Add to ~/.bashrc:
+# source ~/.bash_completion.d/agent-deck
+```
+
+**ZSH:**
+```bash
+# Create completions directory
+mkdir -p ~/.zsh/completions
+
+# Generate completion
+agent-deck completions zsh > ~/.zsh/completions/_agent-deck
+
+# Add to ~/.zshrc if not already present:
+# fpath=(~/.zsh/completions $fpath)
+# autoload -U compinit && compinit
+```
+
+**Fish:**
+```bash
+# Generate completion (Fish auto-loads from this directory)
+mkdir -p ~/.config/fish/completions
+agent-deck completions fish > ~/.config/fish/completions/agent-deck.fish
+```
+
+After installing completions, restart your shell or source the completion file.
 
 ## Session Resolution
 
