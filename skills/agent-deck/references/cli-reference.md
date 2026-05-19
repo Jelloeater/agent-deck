@@ -496,37 +496,47 @@ Supported shells:
 
 **Bash:**
 ```bash
-# System-wide (requires sudo)
+# System-wide (requires sudo) — works automatically after bash-completion is loaded
 agent-deck completions bash | sudo tee /etc/bash_completion.d/agent-deck > /dev/null
 
-# User-level
+# User-level — add the source line to ~/.bashrc so the file is loaded each session
 mkdir -p ~/.bash_completion.d
 agent-deck completions bash > ~/.bash_completion.d/agent-deck
 # Add to ~/.bashrc:
 # source ~/.bash_completion.d/agent-deck
 ```
 
-**ZSH:**
-```bash
-# Create completions directory
-mkdir -p ~/.zsh/completions
+> **Note:** The generated Bash script uses `_init_completion` when the
+> [`bash-completion`](https://github.com/scop/bash-completion) package is
+> present, and falls back to built-in Bash variables otherwise. Both paths work
+> without any extra configuration.
 
-# Generate completion
+**ZSH:**
+
+The generated `_agent-deck` file must be placed on your `fpath` **before**
+`compinit` is called. Do **not** source it directly from `.zshrc`.
+
+```bash
+# Create completions directory and generate the completion file
+mkdir -p ~/.zsh/completions
 agent-deck completions zsh > ~/.zsh/completions/_agent-deck
 
-# Add to ~/.zshrc if not already present:
+# Add to ~/.zshrc BEFORE the compinit call:
 # fpath=(~/.zsh/completions $fpath)
 # autoload -U compinit && compinit
 ```
 
+After editing `.zshrc`, start a new shell (or run `exec zsh`) for the
+completions to take effect.
+
 **Fish:**
 ```bash
-# Generate completion (Fish auto-loads from this directory)
+# Fish auto-loads completion files from this directory — no further setup needed
 mkdir -p ~/.config/fish/completions
 agent-deck completions fish > ~/.config/fish/completions/agent-deck.fish
 ```
 
-After installing completions, restart your shell or source the completion file.
+After installing completions, start a new shell session for the changes to take effect.
 
 ## Session Resolution
 

@@ -1,548 +1,616 @@
 package main
 
 import (
-	"fmt"
-	"os"
-	"strings"
+"fmt"
+"os"
+"strings"
 )
 
-// handleCompletions generates shell completion scripts for Bash, ZSH, and Fish
-func handleCompletions(args []string) {
-	if len(args) == 0 {
-		printCompletionsHelp()
-		return
-	}
+// subCmdEntry describes a single subcommand used by completion generators.
+type subCmdEntry struct {
+name string
+desc string
+}
 
-	shell := args[0]
-	switch strings.ToLower(shell) {
-	case "bash":
-		generateBashCompletion()
-	case "zsh":
-		generateZshCompletion()
-	case "fish":
-		generateFishCompletion()
-	default:
-		fmt.Fprintf(os.Stderr, "Error: unsupported shell '%s'\n", shell)
-		fmt.Fprintln(os.Stderr, "Supported shells: bash, zsh, fish")
-		os.Exit(1)
-	}
+// nestedEntry describes a group of sub-subcommands under a parent subcommand.
+type nestedEntry struct {
+parentSub string
+subs      []subCmdEntry
+}
+
+// cmdEntry is the single source of truth for one top-level CLI command and all
+// its completable subcommands. All three shell generators read from this table;
+// updating a subcommand list here fixes Bash, Zsh, and Fish simultaneously.
+type cmdEntry struct {
+name    string
+aliases []string
+desc    string
+subs    []subCmdEntry
+nested  []nestedEntry // ordered sub-subcommand groups (e.g. "source" under "skill")
+}
+
+// completionCommands mirrors the dispatch table in main.go. Keep it in sync
+// with the case branches in handleSession, handleMCP, etc.
+var completionCommands = []cmdEntry{
+{name: "add", desc: "Add a new session"},
+{name: "launch", desc: "Add, start, and optionally send a message in one step"},
+{name: "try", desc: "Quick experiment (create/find dated folder + session)"},
+{name: "list", aliases: []string{"ls"}, desc: "List all sessions"},
+{name: "remove", aliases: []string{"rm"}, desc: "Remove a session"},
+{name: "rename", aliases: []string{"mv"}, desc: "Rename a session"},
+{name: "status", desc: "Show session status summary"},
+{
+name: "session",
+desc: "Manage session lifecycle",
+subs: []subCmdEntry{
+{"start", "Start a session's tmux process"},
+{"stop", "Stop session process"},
+{"remove", "Remove a session"},
+{"restart", "Restart session (reload MCPs)"},
+{"revive", "Revive a stopped session"},
+{"fork", "Fork session with context"},
+{"attach", "Attach to session interactively"},
+{"show", "Show session details"},
+{"current", "Show current session"},
+{"set-parent", "Set parent group"},
+{"unset-parent", "Unset parent group"},
+{"update", "Update session properties"},
+{"set-transition-notify", "Configure transition notifications"},
+{"set-title-lock", "Configure title lock"},
+{"set", "Set session property"},
+{"move", "Move session to group"},
+{"mv", "Move session to group (alias)"},
+{"send", "Send message to session"},
+{"output", "Show session output"},
+{"search", "Search sessions"},
+},
+},
+{
+name: "mcp",
+desc: "Manage MCP servers",
+subs: []subCmdEntry{
+{"list", "List available MCPs from config.toml"},
+{"ls", "List available MCPs (alias)"},
+{"attached", "Show MCPs attached to a session"},
+{"attach", "Attach MCP to session"},
+{"detach", "Detach MCP from session"},
+{"server", "Manage background MCP server process"},
+},
+nested: []nestedEntry{
+{
+parentSub: "server",
+subs: []subCmdEntry{
+{"start", "Start MCP server"},
+{"stop", "Stop MCP server"},
+{"status", "Show MCP server status"},
+},
+},
+},
+},
+{name: "plugin", desc: "Manage plugins", subs: []subCmdEntry{
+{"list", "List available plugins"},
+{"ls", "List available plugins (alias)"},
+{"attached", "Show plugins attached to session"},
+{"attach", "Attach plugin to session"},
+{"detach", "Detach plugin from session"},
+}},
+{
+name: "skill",
+desc: "Manage project skills",
+subs: []subCmdEntry{
+{"list", "List discoverable skills"},
+{"ls", "List discoverable skills (alias)"},
+{"attached", "Show skills attached to a session"},
+{"attach", "Attach skill to session project"},
+{"detach", "Detach skill from session project"},
+{"source", "Manage global skill sources"},
+},
+nested: []nestedEntry{
+{
+parentSub: "source",
+subs: []subCmdEntry{
+{"list", "List skill sources"},
+{"ls", "List skill sources (alias)"},
+{"add", "Add a skill source"},
+{"remove", "Remove a skill source"},
+{"rm", "Remove a skill source (alias)"},
+},
+},
+},
+},
+{name: "mcp-proxy", desc: "MCP proxy server"},
+{
+name: "group",
+desc: "Manage groups",
+subs: []subCmdEntry{
+{"list", "List all groups"},
+{"ls", "List all groups (alias)"},
+{"create", "Create a new group"},
+{"new", "Create a new group (alias)"},
+{"update", "Update a group"},
+{"set", "Update a group (alias)"},
+{"delete", "Delete a group"},
+{"rm", "Delete a group (alias)"},
+{"remove", "Delete a group (alias)"},
+{"move", "Move session to group"},
+{"mv", "Move session to group (alias)"},
+{"change", "Change session group"},
+{"reparent", "Change session group (alias)"},
+{"reorder", "Reorder groups"},
+{"sort", "Reorder groups (alias)"},
+},
+},
+{
+name:    "worktree",
+aliases: []string{"wt"},
+desc:    "Manage git worktrees",
+subs: []subCmdEntry{
+{"list", "List worktrees with session associations"},
+{"ls", "List worktrees (alias)"},
+{"info", "Show worktree info for a session"},
+{"cleanup", "Find and remove orphaned worktrees/sessions"},
+{"finish", "Mark worktree task as finished"},
+},
+},
+{name: "web", desc: "Start TUI with web UI server"},
+{
+name: "remote",
+desc: "Manage remote agent-deck instances",
+subs: []subCmdEntry{
+{"add", "Register a remote agent-deck instance"},
+{"remove", "Remove a remote"},
+{"rm", "Remove a remote (alias)"},
+{"list", "List configured remotes"},
+{"ls", "List configured remotes (alias)"},
+{"sessions", "Show sessions on remote(s)"},
+{"attach", "Attach to a remote session"},
+{"rename", "Rename a remote session"},
+{"update", "Install/upgrade agent-deck on remote(s)"},
+},
+},
+{
+name: "conductor",
+desc: "Manage conductor meta-agent orchestration",
+subs: []subCmdEntry{
+{"setup", "Set up conductor (Telegram bridge + sessions)"},
+{"teardown", "Stop conductor and remove bridge daemon"},
+{"status", "Show conductor health across profiles"},
+{"list", "List configured conductors"},
+{"move", "Move conductor to another profile"},
+},
+},
+{name: "watcher", desc: "File watcher management"},
+{name: "openclaw", aliases: []string{"oc"}, desc: "OpenClaw integration"},
+{name: "costs", desc: "Show cost analysis"},
+{name: "inbox", desc: "Manage inbox"},
+{name: "feedback", desc: "Provide feedback"},
+{name: "notify-daemon", desc: "Notification daemon"},
+{name: "hook-handler", desc: "Hook handler"},
+{name: "codex-notify", desc: "Codex notification"},
+{name: "hooks", desc: "Manage hooks"},
+{
+name: "codex-hooks",
+desc: "Manage Codex notify hook integration",
+subs: []subCmdEntry{
+{"install", "Install or upgrade Codex notify hook"},
+{"uninstall", "Remove Codex notify hook"},
+{"status", "Show Codex hook install status"},
+},
+},
+{
+name: "gemini-hooks",
+desc: "Manage Gemini hook integration",
+subs: []subCmdEntry{
+{"install", "Install Gemini hooks"},
+{"uninstall", "Remove Gemini hooks"},
+{"status", "Show Gemini hooks install status"},
+},
+},
+{name: "profile", desc: "Manage profiles", subs: []subCmdEntry{
+{"list", "List all profiles"},
+{"ls", "List all profiles (alias)"},
+{"create", "Create a new profile"},
+{"new", "Create a new profile (alias)"},
+{"delete", "Delete a profile"},
+{"rm", "Delete a profile (alias)"},
+{"default", "Show or set default profile"},
+}},
+{name: "update", desc: "Check for and install updates"},
+{name: "debug-dump", desc: "Dump debug ring buffer"},
+{name: "uninstall", desc: "Uninstall Agent Deck"},
+{
+name: "completions",
+desc: "Generate shell completion scripts",
+subs: []subCmdEntry{
+{"bash", "Generate Bash completion script"},
+{"zsh", "Generate ZSH completion script"},
+{"fish", "Generate Fish completion script"},
+},
+},
+{name: "version", desc: "Show version"},
+{name: "help", desc: "Show help"},
+}
+
+// handleCompletions dispatches completions subcommands.
+func handleCompletions(args []string) {
+if code := runCompletions(args); code != 0 {
+os.Exit(code)
+}
+}
+
+// runCompletions is the testable core of handleCompletions.
+// It returns 0 on success and 1 on error, without calling os.Exit.
+func runCompletions(args []string) int {
+if len(args) == 0 || args[0] == "help" || args[0] == "-h" || args[0] == "--help" {
+printCompletionsHelp()
+return 0
+}
+switch strings.ToLower(args[0]) {
+case "bash":
+generateBashCompletion()
+case "zsh":
+generateZshCompletion()
+case "fish":
+generateFishCompletion()
+default:
+fmt.Fprintf(os.Stderr, "Error: unsupported shell %q\n", args[0])
+fmt.Fprintln(os.Stderr, "Supported shells: bash, zsh, fish")
+return 1
+}
+return 0
 }
 
 func printCompletionsHelp() {
-	fmt.Println("Usage: agent-deck completions <shell>")
-	fmt.Println()
-	fmt.Println("Generate shell completion scripts for agent-deck")
-	fmt.Println()
-	fmt.Println("Supported shells:")
-	fmt.Println("  bash    Generate Bash completion script")
-	fmt.Println("  zsh     Generate ZSH completion script")
-	fmt.Println("  fish    Generate Fish completion script")
-	fmt.Println()
-	fmt.Println("Installation:")
-	fmt.Println()
-	fmt.Println("Bash:")
-	fmt.Println("  agent-deck completions bash > /etc/bash_completion.d/agent-deck")
-	fmt.Println("  # or for user-level:")
-	fmt.Println("  agent-deck completions bash > ~/.bash_completion.d/agent-deck")
-	fmt.Println()
-	fmt.Println("ZSH:")
-	fmt.Println("  agent-deck completions zsh > ~/.zsh/completions/_agent-deck")
-	fmt.Println("  # Add to .zshrc if not already present:")
-	fmt.Println("  # fpath=(~/.zsh/completions $fpath)")
-	fmt.Println("  # autoload -U compinit && compinit")
-	fmt.Println()
-	fmt.Println("Fish:")
-	fmt.Println("  agent-deck completions fish > ~/.config/fish/completions/agent-deck.fish")
+fmt.Println("Usage: agent-deck completions <shell>")
+fmt.Println()
+fmt.Println("Generate shell completion scripts for agent-deck")
+fmt.Println()
+fmt.Println("Supported shells:")
+fmt.Println("  bash    Generate Bash completion script")
+fmt.Println("  zsh     Generate ZSH completion script")
+fmt.Println("  fish    Generate Fish completion script")
+fmt.Println()
+fmt.Println("Installation:")
+fmt.Println()
+fmt.Println("Bash (system-wide, requires sudo):")
+fmt.Println("  agent-deck completions bash | sudo tee /etc/bash_completion.d/agent-deck > /dev/null")
+fmt.Println()
+fmt.Println("Bash (user-level, add to ~/.bashrc):")
+fmt.Println("  mkdir -p ~/.bash_completion.d")
+fmt.Println("  agent-deck completions bash > ~/.bash_completion.d/agent-deck")
+fmt.Println("  # Then add to ~/.bashrc: source ~/.bash_completion.d/agent-deck")
+fmt.Println()
+fmt.Println("ZSH (add directory to fpath BEFORE compinit):")
+fmt.Println("  mkdir -p ~/.zsh/completions")
+fmt.Println("  agent-deck completions zsh > ~/.zsh/completions/_agent-deck")
+fmt.Println("  # Add to ~/.zshrc (before compinit):")
+fmt.Println("  #   fpath=(~/.zsh/completions $fpath)")
+fmt.Println("  #   autoload -U compinit && compinit")
+fmt.Println()
+fmt.Println("Fish (auto-loaded from completions directory):")
+fmt.Println("  mkdir -p ~/.config/fish/completions")
+fmt.Println("  agent-deck completions fish > ~/.config/fish/completions/agent-deck.fish")
 }
 
+// generateBashCompletion emits a Bash completion script derived from completionCommands.
+// The script uses a fallback for systems without bash-completion installed, and skips
+// global flags (-p/--profile, -g/--group, --select, --color) when determining which
+// main command is active.
 func generateBashCompletion() {
-	// Bash completion script using complete builtin
-	script := `# bash completion for agent-deck
-_agent_deck_completions() {
-    local cur prev words cword
-    _init_completion || return
+var sb strings.Builder
 
-    # Top-level commands
-    local commands="add launch try list ls remove rm rename mv status session mcp skill plugin codex-hooks gemini-hooks group worktree wt web remote conductor profile update costs inbox feedback watcher openclaw oc notify-daemon hook-handler codex-notify hooks uninstall debug-dump completions version help"
+sb.WriteString("# bash completion for agent-deck\n")
+sb.WriteString("# Generated by: agent-deck completions bash\n\n")
 
-    # Subcommands for each command
-    local session_cmds="start stop restart fork attach show send stream search color move info set-telegram-warnings"
-    local mcp_cmds="list attached attach detach"
-    local skill_cmds="list attached attach detach source"
-    local plugin_cmds="list install uninstall update info"
-    local group_cmds="list create delete move rename set-parent"
-    local worktree_cmds="list info cleanup"
-    local remote_cmds="add remove rm list ls sessions attach rename update"
-    local conductor_cmds="setup teardown status list"
-    local profile_cmds="list create delete default migrate"
-    local codex_hooks_cmds="install uninstall status"
-    local gemini_hooks_cmds="install uninstall status"
-    local skill_source_cmds="list add remove update"
+sb.WriteString("_agent_deck_completions() {\n")
+sb.WriteString("    local cur prev words cword\n")
+// Fallback: _init_completion is supplied by bash-completion (optional package).
+// Use COMP_WORDS/COMP_CWORD directly when it is not available.
+sb.WriteString("    if declare -F _init_completion > /dev/null 2>&1; then\n")
+sb.WriteString("        _init_completion || return\n")
+sb.WriteString("    else\n")
+sb.WriteString("        words=(\"${COMP_WORDS[@]}\")\n")
+sb.WriteString("        cword=$COMP_CWORD\n")
+sb.WriteString("        cur=\"${COMP_WORDS[COMP_CWORD]}\"\n")
+sb.WriteString("        prev=\"${COMP_WORDS[COMP_CWORD-1]}\"\n")
+sb.WriteString("    fi\n\n")
 
-    # If we're at the first argument, complete top-level commands
-    if [[ $cword -eq 1 ]]; then
+// Build top-level command list (names + aliases).
+var allNames []string
+for _, c := range completionCommands {
+allNames = append(allNames, c.name)
+allNames = append(allNames, c.aliases...)
+}
+fmt.Fprintf(&sb, "    local commands=%q\n\n", strings.Join(allNames, " "))
+
+// Emit subcommand list variables.
+for _, c := range completionCommands {
+if len(c.subs) == 0 {
+continue
+}
+var subNames []string
+for _, s := range c.subs {
+subNames = append(subNames, s.name)
+}
+varName := bashVarName(c.name)
+fmt.Fprintf(&sb, "    local %s_cmds=%q\n", varName, strings.Join(subNames, " "))
+for _, n := range c.nested {
+var nestedNames []string
+for _, ns := range n.subs {
+nestedNames = append(nestedNames, ns.name)
+}
+nestedVar := varName + "_" + bashVarName(n.parentSub)
+fmt.Fprintf(&sb, "    local %s_cmds=%q\n", nestedVar, strings.Join(nestedNames, " "))
+}
+}
+
+// Main completion logic: skip global flags to find the actual command.
+sb.WriteString(`
+    # Find main command and subcommand, skipping global flags and their values.
+    local main_cmd="" sub_cmd=""
+    local i
+    for ((i = 1; i < cword; i++)); do
+        local w="${words[$i]}"
+        case "$w" in
+            -p|--profile|-g|--group|--select|--color)
+                ((i++)) # skip the flag's value argument
+                ;;
+            -*)
+                : # skip standalone flags with no value
+                ;;
+            *)
+                if [[ -z "$main_cmd" ]]; then
+                    main_cmd="$w"
+                elif [[ -z "$sub_cmd" ]]; then
+                    sub_cmd="$w"
+                fi
+                ;;
+        esac
+    done
+
+    # No main command typed yet: complete top-level commands.
+    if [[ -z "$main_cmd" ]]; then
         COMPREPLY=($(compgen -W "$commands" -- "$cur"))
         return
     fi
 
-    # Get the main command
-    local main_cmd="${words[1]}"
+    # Main command seen but no subcommand yet: complete subcommands.
+    if [[ -z "$sub_cmd" ]]; then
+        case "$main_cmd" in
+`)
 
-    # Complete subcommands based on main command
+// Per-command subcommand cases.
+for _, c := range completionCommands {
+if len(c.subs) == 0 {
+continue
+}
+varName := bashVarName(c.name)
+names := append([]string{c.name}, c.aliases...)
+fmt.Fprintf(&sb, "            %s)\n", strings.Join(names, "|"))
+fmt.Fprintf(&sb, "                COMPREPLY=($(compgen -W \"$%s_cmds\" -- \"$cur\"))\n", varName)
+sb.WriteString("                ;;\n")
+}
+
+sb.WriteString(`            add|launch|try)
+                COMPREPLY=($(compgen -d -- "$cur"))
+                ;;
+        esac
+        return
+    fi
+
+    # Both main command and subcommand are known: handle nested subcommands.
     case "$main_cmd" in
-        session)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$session_cmds" -- "$cur"))
-            fi
-            ;;
-        mcp)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$mcp_cmds" -- "$cur"))
-            fi
-            ;;
-        skill)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$skill_cmds" -- "$cur"))
-            elif [[ $cword -eq 3 && "${words[2]}" == "source" ]]; then
-                COMPREPLY=($(compgen -W "$skill_source_cmds" -- "$cur"))
-            fi
-            ;;
-        plugin)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$plugin_cmds" -- "$cur"))
-            fi
-            ;;
-        group)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$group_cmds" -- "$cur"))
-            fi
-            ;;
-        worktree|wt)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$worktree_cmds" -- "$cur"))
-            fi
-            ;;
-        remote)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$remote_cmds" -- "$cur"))
-            fi
-            ;;
-        conductor)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$conductor_cmds" -- "$cur"))
-            fi
-            ;;
-        profile)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$profile_cmds" -- "$cur"))
-            fi
-            ;;
-        codex-hooks)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$codex_hooks_cmds" -- "$cur"))
-            fi
-            ;;
-        gemini-hooks)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "$gemini_hooks_cmds" -- "$cur"))
-            fi
-            ;;
-        completions)
-            if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
-            fi
-            ;;
-        add|launch|try)
-            # Complete directories and files
-            COMPREPLY=($(compgen -d -- "$cur"))
-            ;;
-        *)
-            # Default to file/directory completion
-            COMPREPLY=($(compgen -f -- "$cur"))
-            ;;
-    esac
+`)
+
+// Nested subcommand cases.
+for _, c := range completionCommands {
+if len(c.nested) == 0 {
+continue
+}
+varName := bashVarName(c.name)
+names := append([]string{c.name}, c.aliases...)
+fmt.Fprintf(&sb, "        %s)\n", strings.Join(names, "|"))
+sb.WriteString("            case \"$sub_cmd\" in\n")
+for _, n := range c.nested {
+nestedVar := varName + "_" + bashVarName(n.parentSub)
+fmt.Fprintf(&sb, "                %s)\n", n.parentSub)
+fmt.Fprintf(&sb, "                    COMPREPLY=($(compgen -W \"$%s_cmds\" -- \"$cur\"))\n", nestedVar)
+sb.WriteString("                    ;;\n")
+}
+sb.WriteString("            esac\n")
+sb.WriteString("            ;;\n")
+}
+
+sb.WriteString(`    esac
 }
 
 complete -F _agent_deck_completions agent-deck
-`
-	fmt.Print(script)
+`)
+
+fmt.Print(sb.String())
 }
 
+// generateZshCompletion emits a Zsh completion script.
+// Each subcommand function uses _arguments -C with a state machine so that
+// subcommand suggestions stop after a subcommand has already been entered.
 func generateZshCompletion() {
-	// ZSH completion script using _arguments
-	script := `#compdef agent-deck
+var sb strings.Builder
 
-_agent_deck() {
-    local line state
+sb.WriteString("#compdef agent-deck\n\n")
+sb.WriteString("# Generated by: agent-deck completions zsh\n\n")
 
-    _arguments -C \
-        '(-p --profile)'{-p,--profile}'[Use specific profile]:profile:' \
-        '(-g --group)'{-g,--group}'[Launch TUI scoped to group]:group:' \
-        '--select[Launch TUI with cursor on session]:session:' \
-        '1: :_agent_deck_commands' \
-        '*::arg:->args'
+// Top-level function.
+sb.WriteString("_agent_deck() {\n")
+sb.WriteString("    local line state\n\n")
+sb.WriteString("    _arguments -C \\\n")
+sb.WriteString("        '(-p --profile)'{-p,--profile}'[Use specific profile]:profile:' \\\n")
+sb.WriteString("        '(-g --group)'{-g,--group}'[Launch TUI scoped to group]:group:' \\\n")
+sb.WriteString("        '--select[Launch TUI with cursor on session]:session:' \\\n")
+sb.WriteString("        '1: :_agent_deck_commands' \\\n")
+sb.WriteString("        '*::arg:->args'\n\n")
+sb.WriteString("    case $line[1] in\n")
+for _, c := range completionCommands {
+if len(c.subs) == 0 {
+continue
+}
+funcName := "_agent_deck_" + zshFuncName(c.name)
+names := append([]string{c.name}, c.aliases...)
+fmt.Fprintf(&sb, "        %s)\n            %s\n            ;;\n",
+strings.Join(names, "|"), funcName)
+}
+sb.WriteString("        add|launch|try)\n            _files -/\n            ;;\n")
+sb.WriteString("    esac\n}\n\n")
 
-    case $line[1] in
-        session)
-            _agent_deck_session
-            ;;
-        mcp)
-            _agent_deck_mcp
-            ;;
-        skill)
-            _agent_deck_skill
-            ;;
-        plugin)
-            _agent_deck_plugin
-            ;;
-        group)
-            _agent_deck_group
-            ;;
-        worktree|wt)
-            _agent_deck_worktree
-            ;;
-        remote)
-            _agent_deck_remote
-            ;;
-        conductor)
-            _agent_deck_conductor
-            ;;
-        profile)
-            _agent_deck_profile
-            ;;
-        codex-hooks)
-            _agent_deck_codex_hooks
-            ;;
-        gemini-hooks)
-            _agent_deck_gemini_hooks
-            ;;
-        completions)
-            _agent_deck_completions
-            ;;
-        add|launch|try)
-            _files -/
-            ;;
-    esac
+// Top-level commands list.
+sb.WriteString("_agent_deck_commands() {\n    local commands=(\n")
+for _, c := range completionCommands {
+fmt.Fprintf(&sb, "        %s\n", zshCmdSpec(c.name, c.desc))
+for _, alias := range c.aliases {
+fmt.Fprintf(&sb, "        %s\n", zshCmdSpec(alias, c.desc+" (alias)"))
+}
+}
+sb.WriteString("    )\n    _describe 'command' commands\n}\n\n")
+
+// Per-command subcommand functions with state machines.
+for _, c := range completionCommands {
+if len(c.subs) == 0 {
+continue
+}
+funcName := "_agent_deck_" + zshFuncName(c.name)
+fmt.Fprintf(&sb, "%s() {\n", funcName)
+sb.WriteString("    local state\n")
+sb.WriteString("    _arguments -C \\\n")
+sb.WriteString("        '1: :->subcmd' \\\n")
+sb.WriteString("        '*::arg:->args'\n")
+sb.WriteString("    case $state in\n")
+sb.WriteString("        subcmd)\n")
+sb.WriteString("            local commands=(\n")
+for _, sub := range c.subs {
+fmt.Fprintf(&sb, "                %s\n", zshCmdSpec(sub.name, sub.desc))
+}
+sb.WriteString("            )\n")
+fmt.Fprintf(&sb, "            _describe '%s command' commands\n", c.name)
+if len(c.nested) > 0 {
+sb.WriteString("            ;;\n")
+sb.WriteString("        args)\n")
+sb.WriteString("            case $line[1] in\n")
+for _, n := range c.nested {
+fmt.Fprintf(&sb, "                %s)\n", n.parentSub)
+sb.WriteString("                    local sub_commands=(\n")
+for _, ns := range n.subs {
+fmt.Fprintf(&sb, "                        %s\n", zshCmdSpec(ns.name, ns.desc))
+}
+sb.WriteString("                    )\n")
+fmt.Fprintf(&sb, "                    _describe '%s %s command' sub_commands\n",
+c.name, n.parentSub)
+sb.WriteString("                    ;;\n")
+}
+sb.WriteString("            esac\n")
+sb.WriteString("            ;;\n")
+} else {
+sb.WriteString("            ;;\n")
+sb.WriteString("        args) ;;\n")
+}
+sb.WriteString("    esac\n}\n\n")
 }
 
-_agent_deck_commands() {
-    local commands=(
-        'add:Add a new session'
-        'launch:Add, start, and optionally send a message in one step'
-        'try:Quick experiment (create/find dated folder + session)'
-        'list:List all sessions'
-        'ls:List all sessions (alias)'
-        'remove:Remove a session'
-        'rm:Remove a session (alias)'
-        'rename:Rename a session'
-        'mv:Rename a session (alias)'
-        'status:Show session status summary'
-        'session:Manage session lifecycle'
-        'mcp:Manage MCP servers'
-        'skill:Manage project skills'
-        'plugin:Manage plugins'
-        'codex-hooks:Manage Codex notify hook integration'
-        'gemini-hooks:Manage Gemini hook integration'
-        'group:Manage groups'
-        'worktree:Manage git worktrees'
-        'wt:Manage git worktrees (alias)'
-        'web:Start TUI with web UI server'
-        'remote:Manage remote agent-deck instances'
-        'conductor:Manage conductor meta-agent orchestration'
-        'profile:Manage profiles'
-        'update:Check for and install updates'
-        'costs:Show cost analysis'
-        'inbox:Manage inbox'
-        'feedback:Provide feedback'
-        'watcher:File watcher management'
-        'openclaw:OpenClaw integration'
-        'oc:OpenClaw integration (alias)'
-        'notify-daemon:Notification daemon'
-        'hook-handler:Hook handler'
-        'codex-notify:Codex notification'
-        'hooks:Manage hooks'
-        'uninstall:Uninstall Agent Deck'
-        'debug-dump:Dump debug ring buffer'
-        'completions:Generate shell completion scripts'
-        'version:Show version'
-        'help:Show help'
-    )
-    _describe 'command' commands
+sb.WriteString("_agent_deck \"$@\"\n")
+fmt.Print(sb.String())
 }
 
-_agent_deck_session() {
-    local commands=(
-        'start:Start a session'\''s tmux process'
-        'stop:Stop session process'
-        'restart:Restart session (reload MCPs)'
-        'fork:Fork Claude session with context'
-        'attach:Attach to session interactively'
-        'show:Show session details'
-        'send:Send message to session'
-        'stream:Stream session output'
-        'search:Search sessions'
-        'color:Set session color'
-        'move:Move session to group'
-        'info:Show session info'
-        'set-telegram-warnings:Configure Telegram warnings'
-    )
-    _describe 'session command' commands
-}
-
-_agent_deck_mcp() {
-    local commands=(
-        'list:List available MCPs from config.toml'
-        'attached:Show MCPs attached to a session'
-        'attach:Attach MCP to session'
-        'detach:Detach MCP from session'
-    )
-    _describe 'mcp command' commands
-}
-
-_agent_deck_skill() {
-    local commands=(
-        'list:List discoverable skills'
-        'attached:Show skills attached to a session'
-        'attach:Attach skill to session project'
-        'detach:Detach skill from session project'
-        'source:Manage global skill sources'
-    )
-    _describe 'skill command' commands
-}
-
-_agent_deck_plugin() {
-    local commands=(
-        'list:List available plugins'
-        'install:Install a plugin'
-        'uninstall:Uninstall a plugin'
-        'update:Update a plugin'
-        'info:Show plugin information'
-    )
-    _describe 'plugin command' commands
-}
-
-_agent_deck_group() {
-    local commands=(
-        'list:List all groups'
-        'create:Create a new group'
-        'delete:Delete a group'
-        'move:Move session to group'
-        'rename:Rename a group'
-        'set-parent:Set parent group'
-    )
-    _describe 'group command' commands
-}
-
-_agent_deck_worktree() {
-    local commands=(
-        'list:List worktrees with session associations'
-        'info:Show worktree info for a session'
-        'cleanup:Find and remove orphaned worktrees/sessions'
-    )
-    _describe 'worktree command' commands
-}
-
-_agent_deck_remote() {
-    local commands=(
-        'add:Register a remote agent-deck instance'
-        'remove:Remove a remote'
-        'rm:Remove a remote (alias)'
-        'list:List configured remotes'
-        'ls:List configured remotes (alias)'
-        'sessions:Show sessions on remote(s)'
-        'attach:Attach to a remote session'
-        'rename:Rename a remote session'
-        'update:Install/upgrade agent-deck on remote(s)'
-    )
-    _describe 'remote command' commands
-}
-
-_agent_deck_conductor() {
-    local commands=(
-        'setup:Set up conductor (Telegram bridge + sessions)'
-        'teardown:Stop conductor and remove bridge daemon'
-        'status:Show conductor health across profiles'
-        'list:List configured conductors'
-    )
-    _describe 'conductor command' commands
-}
-
-_agent_deck_profile() {
-    local commands=(
-        'list:List all profiles'
-        'create:Create a new profile'
-        'delete:Delete a profile'
-        'default:Show or set default profile'
-        'migrate:Migrate profile data'
-    )
-    _describe 'profile command' commands
-}
-
-_agent_deck_codex_hooks() {
-    local commands=(
-        'install:Install or upgrade Codex notify hook'
-        'uninstall:Remove Codex notify hook'
-        'status:Show Codex hook install status'
-    )
-    _describe 'codex-hooks command' commands
-}
-
-_agent_deck_gemini_hooks() {
-    local commands=(
-        'install:Install Gemini hooks'
-        'uninstall:Remove Gemini hooks'
-        'status:Show Gemini hooks install status'
-    )
-    _describe 'gemini-hooks command' commands
-}
-
-_agent_deck_completions() {
-    local shells=(
-        'bash:Generate Bash completion script'
-        'zsh:Generate ZSH completion script'
-        'fish:Generate Fish completion script'
-    )
-    _describe 'shell' shells
-}
-
-_agent_deck "$@"
-`
-	fmt.Print(script)
-}
-
+// generateFishCompletion emits a Fish completion script.
+// Top-level commands are only offered when no command has been entered yet
+// (__fish_use_subcommand). Subcommands are guarded so they stop appearing once
+// a subcommand has already been selected.
 func generateFishCompletion() {
-	// Fish completion script
-	script := `# fish completion for agent-deck
+var sb strings.Builder
 
-# Remove any existing completions
-complete -c agent-deck -e
+sb.WriteString("# fish completion for agent-deck\n")
+sb.WriteString("# Generated by: agent-deck completions fish\n\n")
+sb.WriteString("# Remove any existing completions\n")
+sb.WriteString("complete -c agent-deck -e\n\n")
+sb.WriteString("# Global options\n")
+sb.WriteString("complete -c agent-deck -s p -l profile -d 'Use specific profile' -r\n")
+sb.WriteString("complete -c agent-deck -s g -l group -d 'Launch TUI scoped to group' -r\n")
+sb.WriteString("complete -c agent-deck -l select -d 'Launch TUI with cursor on session' -r\n\n")
 
-# Global options
-complete -c agent-deck -s p -l profile -d 'Use specific profile' -r
-complete -c agent-deck -s g -l group -d 'Launch TUI scoped to group' -r
-complete -c agent-deck -l select -d 'Launch TUI with cursor on session' -r
+sb.WriteString("# Top-level commands (only when no command has been given yet)\n")
+for _, c := range completionCommands {
+fmt.Fprintf(&sb, "complete -c agent-deck -f -n __fish_use_subcommand -a %s -d '%s'\n",
+c.name, fishEscapeDesc(c.desc))
+for _, alias := range c.aliases {
+fmt.Fprintf(&sb, "complete -c agent-deck -f -n __fish_use_subcommand -a %s -d '%s (alias)'\n",
+alias, fishEscapeDesc(c.desc))
+}
+}
+sb.WriteString("\n")
 
-# Main commands
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'add' -d 'Add a new session'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'launch' -d 'Add, start, and optionally send a message'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'try' -d 'Quick experiment'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'list' -d 'List all sessions'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'ls' -d 'List all sessions'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'remove' -d 'Remove a session'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'rm' -d 'Remove a session'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'rename' -d 'Rename a session'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'mv' -d 'Rename a session'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'status' -d 'Show session status summary'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'session' -d 'Manage session lifecycle'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'mcp' -d 'Manage MCP servers'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'skill' -d 'Manage project skills'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'plugin' -d 'Manage plugins'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'codex-hooks' -d 'Manage Codex notify hook integration'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'gemini-hooks' -d 'Manage Gemini hook integration'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'group' -d 'Manage groups'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'worktree' -d 'Manage git worktrees'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'wt' -d 'Manage git worktrees'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'web' -d 'Start TUI with web UI server'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'remote' -d 'Manage remote instances'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'conductor' -d 'Manage conductor orchestration'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'profile' -d 'Manage profiles'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'update' -d 'Check for and install updates'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'costs' -d 'Show cost analysis'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'inbox' -d 'Manage inbox'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'feedback' -d 'Provide feedback'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'watcher' -d 'File watcher management'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'openclaw' -d 'OpenClaw integration'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'oc' -d 'OpenClaw integration'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'completions' -d 'Generate shell completion scripts'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'version' -d 'Show version'
-complete -c agent-deck -f -n '__fish_use_subcommand' -a 'help' -d 'Show help'
+// Subcommands: guarded by "parent seen AND no sibling subcommand seen yet".
+for _, c := range completionCommands {
+if len(c.subs) == 0 {
+continue
+}
 
-# Session subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'start' -d 'Start a session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'stop' -d 'Stop session process'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'restart' -d 'Restart session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'fork' -d 'Fork Claude session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'attach' -d 'Attach to session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'show' -d 'Show session details'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'send' -d 'Send message to session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'stream' -d 'Stream session output'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'search' -d 'Search sessions'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'color' -d 'Set session color'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'move' -d 'Move session to group'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'info' -d 'Show session info'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from session' -a 'set-telegram-warnings' -d 'Configure Telegram warnings'
+// Build the sibling-subcommand list for the "not yet selected" guard.
+var subNames []string
+for _, sub := range c.subs {
+subNames = append(subNames, sub.name)
+}
+notGuard := "not __fish_seen_subcommand_from " + strings.Join(subNames, " ")
 
-# MCP subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from mcp' -a 'list' -d 'List available MCPs'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from mcp' -a 'attached' -d 'Show MCPs attached to session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from mcp' -a 'attach' -d 'Attach MCP to session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from mcp' -a 'detach' -d 'Detach MCP from session'
+// Parent condition includes the command and all its aliases.
+allParentNames := append([]string{c.name}, c.aliases...)
+parentCond := "__fish_seen_subcommand_from " + strings.Join(allParentNames, " ")
+guard := parentCond + "; and " + notGuard
 
-# Skill subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from skill' -a 'list' -d 'List discoverable skills'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from skill' -a 'attached' -d 'Show skills attached to session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from skill' -a 'attach' -d 'Attach skill to session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from skill' -a 'detach' -d 'Detach skill from session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from skill' -a 'source' -d 'Manage global skill sources'
+fmt.Fprintf(&sb, "# %s subcommands\n", c.name)
+for _, sub := range c.subs {
+fmt.Fprintf(&sb, "complete -c agent-deck -f -n '%s' -a %s -d '%s'\n",
+guard, sub.name, fishEscapeDesc(sub.desc))
+}
+sb.WriteString("\n")
 
-# Plugin subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from plugin' -a 'list' -d 'List available plugins'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from plugin' -a 'install' -d 'Install a plugin'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from plugin' -a 'uninstall' -d 'Uninstall a plugin'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from plugin' -a 'update' -d 'Update a plugin'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from plugin' -a 'info' -d 'Show plugin information'
+// Nested sub-subcommands.
+for _, n := range c.nested {
+var nestedNames []string
+for _, ns := range n.subs {
+nestedNames = append(nestedNames, ns.name)
+}
+nestedNotGuard := "not __fish_seen_subcommand_from " + strings.Join(nestedNames, " ")
+nestedGuard := parentCond + "; and __fish_seen_subcommand_from " + n.parentSub +
+"; and " + nestedNotGuard
 
-# Group subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from group' -a 'list' -d 'List all groups'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from group' -a 'create' -d 'Create a new group'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from group' -a 'delete' -d 'Delete a group'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from group' -a 'move' -d 'Move session to group'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from group' -a 'rename' -d 'Rename a group'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from group' -a 'set-parent' -d 'Set parent group'
+fmt.Fprintf(&sb, "# %s %s subcommands\n", c.name, n.parentSub)
+for _, ns := range n.subs {
+fmt.Fprintf(&sb, "complete -c agent-deck -f -n '%s' -a %s -d '%s'\n",
+nestedGuard, ns.name, fishEscapeDesc(ns.desc))
+}
+sb.WriteString("\n")
+}
+}
 
-# Worktree subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from worktree wt' -a 'list' -d 'List worktrees'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from worktree wt' -a 'info' -d 'Show worktree info'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from worktree wt' -a 'cleanup' -d 'Remove orphaned worktrees'
+fmt.Print(sb.String())
+}
 
-# Remote subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'add' -d 'Register a remote instance'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'remove' -d 'Remove a remote'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'rm' -d 'Remove a remote'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'list' -d 'List configured remotes'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'ls' -d 'List configured remotes'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'sessions' -d 'Show sessions on remotes'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'attach' -d 'Attach to remote session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'rename' -d 'Rename remote session'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from remote' -a 'update' -d 'Install/upgrade on remotes'
+// bashVarName converts a command name to a valid Bash variable name fragment
+// by replacing hyphens with underscores.
+func bashVarName(s string) string {
+return strings.ReplaceAll(s, "-", "_")
+}
 
-# Conductor subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from conductor' -a 'setup' -d 'Set up conductor'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from conductor' -a 'teardown' -d 'Stop conductor'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from conductor' -a 'status' -d 'Show conductor health'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from conductor' -a 'list' -d 'List configured conductors'
+// zshFuncName converts a command name to a Zsh function name fragment.
+func zshFuncName(s string) string {
+return strings.ReplaceAll(s, "-", "_")
+}
 
-# Profile subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from profile' -a 'list' -d 'List all profiles'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from profile' -a 'create' -d 'Create a new profile'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from profile' -a 'delete' -d 'Delete a profile'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from profile' -a 'default' -d 'Show or set default profile'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from profile' -a 'migrate' -d 'Migrate profile data'
+// zshCmdSpec formats a Zsh completion spec string 'name:description',
+// escaping single quotes in the description.
+func zshCmdSpec(name, desc string) string {
+escaped := strings.ReplaceAll(desc, "'", "'\\''")
+return fmt.Sprintf("'%s:%s'", name, escaped)
+}
 
-# Codex hooks subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from codex-hooks' -a 'install' -d 'Install or upgrade Codex hook'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from codex-hooks' -a 'uninstall' -d 'Remove Codex hook'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from codex-hooks' -a 'status' -d 'Show Codex hook status'
-
-# Gemini hooks subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from gemini-hooks' -a 'install' -d 'Install Gemini hooks'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from gemini-hooks' -a 'uninstall' -d 'Remove Gemini hooks'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from gemini-hooks' -a 'status' -d 'Show Gemini hooks status'
-
-# Completions subcommands
-complete -c agent-deck -f -n '__fish_seen_subcommand_from completions' -a 'bash' -d 'Generate Bash completion script'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from completions' -a 'zsh' -d 'Generate ZSH completion script'
-complete -c agent-deck -f -n '__fish_seen_subcommand_from completions' -a 'fish' -d 'Generate Fish completion script'
-`
-	fmt.Print(script)
+// fishEscapeDesc escapes single quotes in Fish completion descriptions.
+func fishEscapeDesc(s string) string {
+return strings.ReplaceAll(s, "'", "\\'")
 }
