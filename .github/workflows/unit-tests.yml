@@ -1,0 +1,45 @@
+# Unit test CI gate.
+#
+# Runs on every PR that touches cmd/agent-deck/** to verify that all
+# Go unit tests pass with the race detector enabled. This catches
+# regressions from CLI command additions or changes before merge.
+#
+# Mirrors the `go test -race ./...` step in release.yml but scoped to
+# PRs so failures are caught before a tag is cut.
+
+name: Unit tests
+
+on:
+  pull_request:
+    paths:
+      - 'cmd/agent-deck/**'
+      - 'internal/**'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/unit-tests.yml'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  unit-tests:
+    name: go test -race ./cmd/agent-deck/...
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install zoxide
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y zoxide
+          zoxide --version
+
+      - name: Run unit tests
+        run: go test -race -count=1 -timeout 5m ./cmd/agent-deck/...
