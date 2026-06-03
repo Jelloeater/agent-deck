@@ -365,6 +365,10 @@ type Instance struct {
 	// Set by MCP dialog Apply() to avoid race condition where Apply writes
 	// config then Restart immediately overwrites it with different pool state
 	SkipMCPRegenerate bool `json:"-"` // Don't persist, transient flag
+
+	// Gateway health cache for Hermes sessions (volatile, not persisted).
+	hermesGatewayCheckedAt time.Time
+	hermesGatewayOK        bool
 }
 
 // SandboxConfig holds per-session Docker sandbox settings.
@@ -532,6 +536,18 @@ func (inst *Instance) GetLastActivityTime() time.Time {
 	return inst.CreatedAt
 }
 
+// LastObservedActivity returns the last time the tmux tracker confirmed a
+// real busy spike for this session, and a bool that is false when no
+// confirmation has happened (the instance has no tmux session, or the
+// tracker has never observed activity). When the bool is false the time
+// value is zero.
+func (inst *Instance) LastObservedActivity() (time.Time, bool) {
+	if inst.tmuxSession == nil {
+		return time.Time{}, false
+	}
+	return inst.tmuxSession.LastObservedActivity()
+}
+
 // GetWaitingSince returns when the session transitioned to waiting status
 // Used for sorting notification bar (newest waiting sessions first)
 func (inst *Instance) GetWaitingSince() time.Time {
@@ -628,6 +644,23 @@ func (i *Instance) applyLaunchSettingsFromConfig() {
 	settings := GetTmuxSettings()
 	i.tmuxSession.LaunchInUserScope = settings.GetLaunchInUserScope()
 	i.tmuxSession.LaunchAs = settings.GetLaunchAs()
+	i.applyVimModeFromConfig()
+}
+
+// applyVimModeFromConfig copies [claude].vim_mode onto the tmux session so the
+// keysender prepends an Escape + `i` insert-mode guarantee before each send.
+// Only meaningful for Claude-compatible tools; other tools never sit in a vim
+// composer, so we leave the flag at its zero value (false) for them to keep
+// their send path byte-identical (issue #1264).
+func (i *Instance) applyVimModeFromConfig() {
+	if i.tmuxSession == nil || !IsClaudeCompatible(i.Tool) {
+		return
+	}
+	cfg, _ := LoadUserConfig()
+	if cfg == nil {
+		return
+	}
+	i.tmuxSession.VimMode = cfg.Claude.GetVimMode()
 }
 
 // NewInstanceWithGroup creates a new session instance with explicit group
@@ -3384,7 +3417,7 @@ func (i *Instance) UpdateStatus() error {
 
 	// COLD LOAD: CLI doesn't run StatusFileWatcher, so hookStatus is always empty.
 	// Read the hook file from disk once to give CLI the same fast path as the TUI.
-	if i.hookStatus == "" && (IsClaudeCompatible(i.Tool) || i.Tool == "codex" || i.Tool == "gemini") {
+	if i.hookStatus == "" && (IsClaudeCompatible(i.Tool) || i.Tool == "codex" || i.Tool == "gemini" || i.Tool == "hermes") {
 		if hs := readHookStatusFile(i.ID); hs != nil {
 			i.hookStatus = hs.Status
 			i.hookEvent = hs.Event
@@ -3403,7 +3436,7 @@ func (i *Instance) UpdateStatus() error {
 	// Freshness is tool- and state-specific (e.g. Codex running vs waiting).
 	// When this path is stale/missing, control naturally falls through to tmux
 	// polling and tool-specific session sync (tmux env/process-files/disk).
-	if (IsClaudeCompatible(i.Tool) || IsCodexCompatible(i.Tool) || i.Tool == "gemini") &&
+	if (IsClaudeCompatible(i.Tool) || IsCodexCompatible(i.Tool) || i.Tool == "gemini" || i.Tool == "hermes") &&
 		i.hookStatus != "" &&
 		time.Since(i.hookLastUpdate) < hookFastPathFreshnessForTool(i.Tool, i.hookStatus) {
 		switch i.hookStatus {
@@ -3457,6 +3490,32 @@ func (i *Instance) UpdateStatus() error {
 				}
 			}
 		}
+		// A1: For Hermes, run the gateway reachability check even on the fast path.
+		// Without this, a dead gateway can still report running/waiting for the full
+		// hook freshness window because the check below is skipped.
+		// Use GetHermesGatewayURL() so the common auto-discovery setup (no explicit
+		// [hermes].gateway_url in config) still gets gateway-health degradation —
+		// reading config.Hermes.GatewayURL directly would skip the discovery path
+		// via ~/.hermes/gateway_state.json.
+		if i.Tool == "hermes" && (i.Status == StatusRunning || i.Status == StatusWaiting) {
+			if gatewayURL := GetHermesGatewayURL(); gatewayURL != "" {
+				if time.Since(i.hermesGatewayCheckedAt) > 30*time.Second {
+					i.mu.Unlock()
+					reachable := IsHermesGatewayReachable(gatewayURL)
+					i.mu.Lock()
+					// Mirror the stale-stop guard from the tmux path: a concurrent
+					// Kill() may have published StatusStopped while we were unlocked.
+					if i.Status == StatusStopped {
+						return nil
+					}
+					i.hermesGatewayCheckedAt = time.Now()
+					i.hermesGatewayOK = reachable
+				}
+				if !i.hermesGatewayOK {
+					i.Status = StatusError
+				}
+			}
+		}
 		return nil
 	}
 
@@ -3497,6 +3556,33 @@ func (i *Instance) UpdateStatus() error {
 		i.Status = StatusError
 	default:
 		i.Status = StatusError
+	}
+
+	// Hermes: augment status with gateway health when a gateway URL is resolvable.
+	// Check is throttled to 30s to avoid 1.5s HTTP delays on every status tick.
+	// Use GetHermesGatewayURL() so the auto-discovery path (gateway_state.json +
+	// loopback probe) gets the same degradation behavior as an explicit config
+	// override — without this, users on the documented-easy setup never see a
+	// dead gateway flip them to StatusError.
+	if i.Tool == "hermes" && i.Status != StatusStopped && i.Status != StatusError {
+		if gatewayURL := GetHermesGatewayURL(); gatewayURL != "" {
+			if time.Since(i.hermesGatewayCheckedAt) > 30*time.Second {
+				// A2: A concurrent Kill() may publish StatusStopped while we are
+				// unlocked for the HTTP probe; re-check after reacquiring the lock
+				// and skip the write to avoid clobbering the stop.
+				i.mu.Unlock()
+				reachable := IsHermesGatewayReachable(gatewayURL)
+				i.mu.Lock()
+				if i.Status == StatusStopped {
+					return nil
+				}
+				i.hermesGatewayCheckedAt = time.Now()
+				i.hermesGatewayOK = reachable
+			}
+			if !i.hermesGatewayOK {
+				i.Status = StatusError
+			}
+		}
 	}
 
 	// Update tool detection dynamically (enables fork when wrapped tools start).
@@ -6284,6 +6370,32 @@ func (i *Instance) SetCodexOptions(opts *CodexOptions) error {
 	return nil
 }
 
+// GetHermesOptions returns Hermes-specific options from ToolOptionsJSON, or nil if not set.
+func (i *Instance) GetHermesOptions() *HermesOptions {
+	if len(i.ToolOptionsJSON) == 0 {
+		return nil
+	}
+	opts, err := UnmarshalHermesOptions(i.ToolOptionsJSON)
+	if err != nil {
+		return nil
+	}
+	return opts
+}
+
+// SetHermesOptions stores Hermes-specific options into ToolOptionsJSON.
+func (i *Instance) SetHermesOptions(opts *HermesOptions) error {
+	if opts == nil {
+		i.ToolOptionsJSON = nil
+		return nil
+	}
+	data, err := MarshalToolOptions(opts)
+	if err != nil {
+		return err
+	}
+	i.ToolOptionsJSON = data
+	return nil
+}
+
 // GetOpenCodeOptions returns OpenCode-specific options, or nil if not set
 func (i *Instance) GetOpenCodeOptions() *OpenCodeOptions {
 	if len(i.ToolOptionsJSON) == 0 {
@@ -6346,8 +6458,11 @@ func (i *Instance) RefreshLiveSessionIDs() {
 	}
 }
 
-// GetMCPInfo returns MCP server information for this session
-// Returns nil if not a Claude, Gemini, or Cursor session
+// GetMCPInfo returns MCP server information for this session.
+// Returns nil if not a Claude-compatible, Gemini, or Cursor session.
+// Hermes is intentionally excluded: it uses its own ~/.hermes/config.yaml
+// `mcp_servers:` schema (user-scoped, YAML), not Claude's project-scoped
+// .mcp.json — agent-deck does not manage it yet.
 func (i *Instance) GetMCPInfo() *MCPInfo {
 	switch {
 	case IsClaudeCompatible(i.Tool):

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -413,6 +414,11 @@ type Home struct {
 	defaultFilter        string                  // from config.toml [display] default_filter
 	activeFilterLabel    string                  // from config.toml [display] active_filter_label
 	activeFilterExcludes map[session.Status]bool // from config.toml [display] active_filter_excludes; default {error}
+
+	// showSessionTimestamps gates the dim "Nm ago" badge on each session row.
+	// Cached here so all rows of a single frame see the same value even if
+	// the user toggles the setting mid-frame. Reloaded after the panel saves.
+	showSessionTimestamps bool
 
 	// Sessions/Preview split (issue #1092): percentage of width allocated to
 	// preview pane. Loaded from config.toml [ui] preview_pct, adjustable
@@ -980,6 +986,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.activeFilterLabel = cfg.Display.ActiveFilterLabel
 		h.activeFilterExcludes = cfg.Display.GetActiveFilterExcludes()
 		tmux.SetHideCwdPrefixInTitle(!cfg.Display.GetIncludeCwdPrefix())
+		h.showSessionTimestamps = cfg.Display.ShowSessionTimestamps
 		h.sysStatsConfig = cfg.SystemStats
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(cfg, actualProfile)
 		h.previewPct = cfg.UI.GetPreviewPct()
@@ -1170,6 +1177,36 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 			}
 			if !prompted {
 				h.pendingHooksPrompt = true
+			}
+		}
+	}
+
+	// Hermes shell hooks: auto-inject silently if the hermes binary is available.
+	// No user prompt needed — config.yaml is Hermes's own config file, not a
+	// shared settings file. The shared hook watcher (h.hookWatcher) covers all
+	// tools, so start it here if Claude hooks didn't already start it.
+	if hermesCmd := strings.TrimSpace(session.GetToolCommand("hermes")); hermesCmd != "" {
+		// GetToolCommand may return a full command string with arguments
+		// (e.g. "hermes --gateway-url=..."). LookPath needs the binary name only.
+		// Trim first because Fields("") and Fields("   ") both return [], and
+		// indexing [0] on an empty slice panics.
+		if hermesFields := strings.Fields(hermesCmd); len(hermesFields) > 0 {
+			hermesBin := hermesFields[0]
+			if _, err := exec.LookPath(hermesBin); err == nil {
+				hermesConfigDir := session.GetHermesConfigDir()
+				if !session.CheckHermesHooksInstalled(hermesConfigDir) {
+					if _, err := session.InjectHermesHooks(hermesConfigDir); err != nil {
+						uiLog.Warn("hermes_hooks_inject_failed", slog.String("error", err.Error()))
+					} else {
+						uiLog.Info("hermes_hooks_installed", slog.String("config_dir", hermesConfigDir))
+					}
+				}
+				if h.hookWatcher == nil {
+					if hookWatcher, err := session.NewStatusFileWatcher(nil); err == nil {
+						h.hookWatcher = hookWatcher
+						go hookWatcher.Start()
+					}
+				}
 			}
 		}
 	}
@@ -3228,7 +3265,7 @@ func (h *Home) backgroundStatusUpdate() {
 	// Feed hook statuses from watcher to instances (enables hook fast path in UpdateStatus)
 	if h.hookWatcher != nil {
 		for _, inst := range instances {
-			if session.IsClaudeCompatible(inst.Tool) || inst.Tool == "codex" || inst.Tool == "gemini" {
+			if session.IsClaudeCompatible(inst.Tool) || inst.Tool == "codex" || inst.Tool == "gemini" || inst.Tool == "hermes" {
 				if hs := h.hookWatcher.GetHookStatus(inst.ID); hs != nil {
 					inst.UpdateHookStatus(hs)
 				}
@@ -5362,6 +5399,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				_, _ = session.ReloadUserConfig()
 				h.reloadHotkeysFromConfig()
+				h.showSessionTimestamps = config.Display.ShowSessionTimestamps
 
 				// Apply theme changes live
 				h.stopThemeWatcher()
@@ -5754,6 +5792,10 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			yolo := h.newDialog.GetCodexYoloMode()
 			codexOpts := &session.CodexOptions{YoloMode: &yolo}
 			toolOptionsJSON, _ = session.MarshalToolOptions(codexOpts)
+		} else if command == "hermes" {
+			yolo := h.newDialog.GetHermesYoloMode()
+			hermesOpts := &session.HermesOptions{YoloMode: &yolo}
+			toolOptionsJSON, _ = session.MarshalToolOptions(hermesOpts)
 		}
 
 		parentSessionID := h.newDialog.GetParentSessionID()
@@ -7216,6 +7258,25 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					}
 					opts.YoloMode = &newYolo
 					_ = inst.SetCodexOptions(opts)
+					toggled = true
+
+				case "hermes":
+					currentYolo := false
+					opts := inst.GetHermesOptions()
+					if opts != nil && opts.YoloMode != nil {
+						currentYolo = *opts.YoloMode
+					} else {
+						userConfig, _ := session.LoadUserConfig()
+						if userConfig != nil {
+							currentYolo = userConfig.Hermes.YoloMode
+						}
+					}
+					newYolo := !currentYolo
+					if opts == nil {
+						opts = &session.HermesOptions{}
+					}
+					opts.YoloMode = &newYolo
+					_ = inst.SetHermesOptions(opts)
 					toggled = true
 				}
 
@@ -12447,6 +12508,16 @@ func (h *Home) renderSessionItem(
 		if opts := inst.GetCodexOptions(); opts != nil && opts.YoloMode != nil && *opts.YoloMode {
 			showYolo = true
 		}
+	} else if instTool == "hermes" {
+		// Mirror the toggle path's resolution: per-session override wins; otherwise
+		// fall back to the global [hermes].yolo_mode in user config. Without the
+		// fallback the badge lies about state for sessions launched with YOLO via
+		// global config but no per-session override.
+		if opts := inst.GetHermesOptions(); opts != nil && opts.YoloMode != nil {
+			showYolo = *opts.YoloMode
+		} else if cfg, _ := session.LoadUserConfig(); cfg != nil && cfg.Hermes.YoloMode {
+			showYolo = true
+		}
 	}
 	if showYolo {
 		yoloStyle := lipgloss.NewStyle().Foreground(ColorYellow).Bold(true)
@@ -12505,6 +12576,24 @@ func (h *Home) renderSessionItem(
 		sshBadge = sshStyle.Render(" [ssh:" + host + "]")
 	}
 
+	// Last-update timestamp badge — see pickBadgeTime for the formula.
+	// Selected rows reuse the selection-bar style instead of dim, so the
+	// badge stays legible inside the highlight.
+	timestampBadge := ""
+	if h.showSessionTimestamps {
+		tsStyle := DimStyle
+		if selected {
+			tsStyle = SessionStatusSelStyle
+		}
+		var hookStatus *session.HookStatus
+		if h.hookWatcher != nil {
+			hookStatus = h.hookWatcher.GetHookStatus(inst.ID)
+		}
+		confirmedTs, confirmedObserved := inst.LastObservedActivity()
+		ts := pickBadgeTime(inst.CreatedAt, inst.LastStartedAt, hookStatus, confirmedTs, confirmedObserved)
+		timestampBadge = tsStyle.Render(" " + formatRelativeTime(ts))
+	}
+
 	// Window expand/collapse chevron for sessions with 2+ windows
 	windowChevron := " " // space placeholder to keep status icons aligned
 	if h.sessionHasWindows(item) {
@@ -12521,7 +12610,7 @@ func (h *Home) renderSessionItem(
 
 	// Build row: [baseIndent][selection][tree][chevron][status] [title] [tool] [badges]
 	row := fmt.Sprintf(
-		"%s%s%s%s%s %s%s%s%s%s%s%s",
+		"%s%s%s%s%s %s%s%s%s%s%s%s%s",
 		baseIndent,
 		selectionPrefix,
 		treeStyle.Render(treeConnector),
@@ -12534,6 +12623,7 @@ func (h *Home) renderSessionItem(
 		sandboxBadge,
 		multiRepoBadge,
 		sshBadge,
+		timestampBadge,
 	)
 
 	// Append pane title filling remaining row space (only for the selected item).
@@ -13137,13 +13227,16 @@ func (h *Home) renderSessionInfoCard(inst *session.Instance, width, height int) 
 	// Tool
 	b.WriteString(fmt.Sprintf("%s %s\n", labelStyle.Render("Tool:"), valueStyle.Render(cardTool)))
 
-	// Session ID (if available) - Claude, Gemini, or OpenCode
+	// Session ID (if available) - Claude, Gemini, OpenCode, or generic (Hermes/custom tools)
 	sessionID := inst.ClaudeSessionID
 	if sessionID == "" {
 		sessionID = inst.GeminiSessionID
 	}
 	if sessionID == "" {
 		sessionID = inst.OpenCodeSessionID
+	}
+	if sessionID == "" {
+		sessionID = inst.GetGenericSessionID()
 	}
 	if sessionID != "" {
 		shortID := sessionID
@@ -14531,6 +14624,27 @@ func truncatePath(path string, maxLen int) string {
 		return cellTruncate(path, maxLen-3, "...")
 	}
 	return string(runes[:startLen]) + "..." + string(runes[len(runes)-endLen:])
+}
+
+// pickBadgeTime returns the most recent of the four signals the session-row
+// timestamp badge layers over, ignoring any signal that is unset / not
+// observed. Pure function — kept out of renderSessionItem so the 4-layer
+// composition can be unit-tested without faking renderer dependencies.
+//
+// LastAccessedAt is deliberately not a parameter: peeking at a quiet
+// session isn't an "update".
+func pickBadgeTime(createdAt, lastStartedAt time.Time, hookEvent *session.HookStatus, confirmedActivity time.Time, confirmedObserved bool) time.Time {
+	ts := createdAt
+	if lastStartedAt.After(ts) {
+		ts = lastStartedAt
+	}
+	if hookEvent != nil && hookEvent.UpdatedAt.After(ts) {
+		ts = hookEvent.UpdatedAt
+	}
+	if confirmedObserved && confirmedActivity.After(ts) {
+		ts = confirmedActivity
+	}
+	return ts
 }
 
 // formatRelativeTime formats a time as a human-readable relative string

@@ -405,6 +405,8 @@ type ProfileCodexSettings struct {
 type GroupSettings struct {
 	// Claude defines Claude Code overrides for a specific group.
 	Claude GroupClaudeSettings `toml:"claude"`
+	// Hermes defines Hermes overrides for a specific group.
+	Hermes GroupHermesSettings `toml:"hermes"`
 }
 
 // GroupClaudeSettings defines group-specific Claude overrides.
@@ -414,6 +416,16 @@ type GroupClaudeSettings struct {
 
 	// EnvFile overrides [claude].env_file for sessions in this group.
 	EnvFile string `toml:"env_file"`
+}
+
+// GroupHermesSettings defines group-specific Hermes overrides.
+type GroupHermesSettings struct {
+	Command      string `toml:"command"`
+	EnvFile      string `toml:"env_file"`
+	YoloMode     bool   `toml:"yolo_mode"`
+	GatewayURL   string `toml:"gateway_url"`
+	DashboardURL string `toml:"dashboard_url"`
+	APITokenEnv  string `toml:"api_token_env"`
 }
 
 // ConductorOverrides defines per-conductor configuration overrides.
@@ -428,6 +440,8 @@ type GroupClaudeSettings struct {
 type ConductorOverrides struct {
 	// Claude defines Claude Code overrides for a specific conductor.
 	Claude ConductorClaudeSettings `toml:"claude"`
+	// Hermes defines Hermes overrides for a specific conductor.
+	Hermes ConductorHermesSettings `toml:"hermes"`
 }
 
 // ConductorClaudeSettings defines conductor-specific Claude overrides.
@@ -441,6 +455,16 @@ type ConductorClaudeSettings struct {
 	// EnvFile is sourced before claude exec for this conductor.
 	// Matches CFG-03 semantics — missing file logs a warning, does not block.
 	EnvFile string `toml:"env_file"`
+}
+
+// ConductorHermesSettings defines conductor-specific Hermes overrides.
+type ConductorHermesSettings struct {
+	Command      string `toml:"command"`
+	EnvFile      string `toml:"env_file"`
+	YoloMode     bool   `toml:"yolo_mode"`
+	GatewayURL   string `toml:"gateway_url"`
+	DashboardURL string `toml:"dashboard_url"`
+	APITokenEnv  string `toml:"api_token_env"`
 }
 
 // MCPPoolSettings defines HTTP MCP pool configuration
@@ -911,6 +935,24 @@ type ClaudeSettings struct {
 	// otherwise sit frozen on the picker forever (closes #67).
 	// Default: true (nil = use default true, set false to disable).
 	AutoResumeSummary *bool `toml:"auto_resume_summary"`
+
+	// VimMode tells agent-deck the inner Claude Code prompt uses vim keybindings
+	// ("editorMode": "vim"). When true, every message send guarantees the
+	// composer is in insert mode (Escape + `i`) before delivering text/Enter, so
+	// a message sent while the prompt sits in vim NORMAL mode (the default state
+	// after a turn finishes) actually submits instead of being typed-but-unsent
+	// (issue #1264). Off by default — only enable for sessions running Claude
+	// Code with vim editor mode. Other tools and non-vim Claude are unaffected.
+	VimMode bool `toml:"vim_mode"`
+}
+
+// GetVimMode reports whether vim-mode insert-guard sends are enabled. Off by
+// default (issue #1264).
+func (c *ClaudeSettings) GetVimMode() bool {
+	if c == nil {
+		return false
+	}
+	return c.VimMode
 }
 
 // GetProfileClaudeConfigDir returns the profile-specific Claude config directory, if configured.
@@ -958,6 +1000,21 @@ func (c *UserConfig) GetGroupClaudeEnvFile(groupPath string) string {
 	return ""
 }
 
+// GetGroupHermesEnvFile returns the group-specific Hermes env file, walking
+// ancestor groups when the exact path has no override. Mirrors
+// GetGroupClaudeEnvFile's inheritance semantics.
+func (c *UserConfig) GetGroupHermesEnvFile(groupPath string) string {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return ""
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if groupCfg, ok := c.Groups[p]; ok && groupCfg.Hermes.EnvFile != "" {
+			return groupCfg.Hermes.EnvFile
+		}
+	}
+	return ""
+}
+
 // GetConductorClaudeConfigDir returns the conductor-specific Claude config
 // directory, if configured. Keyed by conductor name (Instance.Title minus
 // "conductor-" prefix — single source of truth is conductorNameFromInstance
@@ -987,6 +1044,19 @@ func (c *UserConfig) GetConductorClaudeEnvFile(name string) string {
 		return ""
 	}
 	return conductorCfg.Claude.EnvFile
+}
+
+// GetConductorHermesEnvFile returns the conductor-specific Hermes env_file,
+// if configured. Mirrors GetConductorClaudeEnvFile.
+func (c *UserConfig) GetConductorHermesEnvFile(name string) string {
+	if c == nil || name == "" || c.Conductors == nil {
+		return ""
+	}
+	conductorCfg, ok := c.Conductors[name]
+	if !ok || conductorCfg.Hermes.EnvFile == "" {
+		return ""
+	}
+	return conductorCfg.Hermes.EnvFile
 }
 
 // GetDangerousMode returns whether dangerous mode is enabled, defaulting to true
@@ -1127,6 +1197,18 @@ type HermesSettings struct {
 	// YoloMode enables --yolo flag for Hermes sessions (auto-approve all tool calls).
 	// Default: false
 	YoloMode bool `toml:"yolo_mode"`
+	// GatewayURL is the WebSocket URL of the Hermes gateway for health checks.
+	// Default: "" (no gateway health check)
+	GatewayURL string `toml:"gateway_url"`
+	// DashboardURL is the Hermes dashboard API endpoint.
+	// Default: "" (dashboard integration disabled)
+	DashboardURL string `toml:"dashboard_url"`
+	// APITokenEnv is the environment variable name containing the Hermes API token.
+	// Default: "" (uses HERMES_API_TOKEN if set)
+	APITokenEnv string `toml:"api_token_env"`
+	// WorkspaceDir is the base directory for Hermes shared workspace sessions.
+	// Default: "" (uses os.TempDir()/hermes-workspaces)
+	WorkspaceDir string `toml:"workspace_dir"`
 }
 
 // CrushSettings defines charmbracelet/crush CLI configuration (Issue #940).
@@ -1841,6 +1923,11 @@ type DisplaySettings struct {
 	// preserves the historical format; set false to show only the session
 	// title. Consumed by the tmux set-titles-string builder.
 	IncludeCwdPrefix *bool `toml:"include_cwd_prefix"`
+
+	// ShowSessionTimestamps appends a dim "Nm ago" badge to every session row.
+	// Default: false — opt-in to avoid crowding existing badges. See
+	// renderSessionItem for the timestamp source.
+	ShowSessionTimestamps bool `toml:"show_session_timestamps"`
 }
 
 // GetActiveFilterExcludes returns the resolved set of statuses the % filter
@@ -2229,37 +2316,18 @@ func isShellEnvAssignment(token string) bool {
 // GetToolDef returns a tool definition from user config
 // Returns nil if tool is not defined
 func GetToolDef(toolName string) *ToolDef {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil {
-		return nil
-	}
-
-	if def, ok := config.Tools[toolName]; ok {
-		return &def
-	}
-	return nil
+	// Delegates to the registry's custom-tool lookup. GetCustom returns nil for
+	// built-in names (their shadowing custom entries are rejected at registry
+	// init), preserving this function's long-standing "nil for built-ins"
+	// contract that callers branch on. See Registry.GetCustom / Registry.Get.
+	return currentRegistry().GetCustom(toolName)
 }
 
 // GetCustomToolNames returns sorted custom tool names from config.toml,
 // excluding names that shadow built-in tools (claude, gemini, opencode, codex, pi, shell, cursor, aider).
 // Returns nil if no custom tools are configured.
 func GetCustomToolNames() []string {
-	config, err := LoadUserConfig()
-	if err != nil || config == nil || len(config.Tools) == 0 {
-		return nil
-	}
-
-	var names []string
-	for name := range config.Tools {
-		if !isBuiltinToolName(name) {
-			names = append(names, name)
-		}
-	}
-	if len(names) == 0 {
-		return nil
-	}
-	sort.Strings(names)
-	return names
+	return currentRegistry().CustomNames()
 }
 
 // GetToolCommand returns the configured command override for a builtin tool,
@@ -2299,12 +2367,7 @@ func GetToolCommand(toolName string) string {
 }
 
 func isBuiltinToolName(toolName string) bool {
-	switch toolName {
-	case "claude", "gemini", "opencode", "codex", "copilot", "crush", "cursor", "hermes", "pi", "shell", "aider":
-		return true
-	default:
-		return false
-	}
+	return currentRegistry().IsBuiltin(toolName)
 }
 
 // GetToolIcon returns the icon for a tool (custom or built-in)
