@@ -784,6 +784,7 @@ func knownModelIDsForTool(tool string) []string {
 	case session.IsClaudeCompatible(tool):
 		return []string{
 			"claude-sonnet-4-6",
+			"claude-opus-4-8",
 			"claude-opus-4-7",
 			"claude-haiku-4-5",
 			"claude-haiku-4-5-20251001",
@@ -810,6 +811,7 @@ func knownModelIDsForTool(tool string) []string {
 			"openai/gpt-5",
 			"openai/o3",
 			"anthropic/claude-sonnet-4-6",
+			"anthropic/claude-opus-4-8",
 			"anthropic/claude-opus-4-7",
 			"anthropic/claude-haiku-4-5",
 		}
@@ -2079,6 +2081,12 @@ func (d *NewDialog) Update(msg tea.Msg) (*NewDialog, tea.Cmd) {
 	return d, cmd
 }
 
+// Returns the screen row/col where a dialog of the given size, in a terminal
+// of (termWidth x termHeight), begins.
+func dialogOrigin(termWidth, termHeight, dialogWidth, dialogHeight int) (row, col int) {
+	return max(0, (termHeight-dialogHeight)/2), max(0, (termWidth-dialogWidth)/2)
+}
+
 // View renders the dialog.
 func (d *NewDialog) View() string {
 	if !d.visible {
@@ -2558,13 +2566,9 @@ func (d *NewDialog) View() string {
 	// Rendered as a floating bordered menu over the placed dialog so it
 	// doesn't shift the layout when it appears/disappears.
 	if suggestionsOverlay := d.renderSuggestionsDropdown(); suggestionsOverlay != "" {
-		// Find where to place the overlay:
-		// The dialog is centered, so we need the dialog's top-left position
-		// within the placed output, plus the line offset to the path input.
-		dialogHeight := lipgloss.Height(dialog)
-		dialogWidth := lipgloss.Width(dialog)
-		topRow := (d.height - dialogHeight) / 2
-		leftCol := (d.width - dialogWidth) / 2
+		// Anchor the floating menu to the dialog's top-left, then add the line
+		// offset down to the path input.
+		topRow, leftCol := dialogOrigin(d.width, d.height, lipgloss.Width(dialog), lipgloss.Height(dialog))
 
 		// suggestionsLineOffset is the content line where the dropdown should appear.
 		// Add border (1) + top padding (2) to get the actual row within the dialog box.
@@ -2576,10 +2580,7 @@ func (d *NewDialog) View() string {
 	}
 
 	if modelOverlay := d.renderModelSuggestionsDropdown(); modelOverlay != "" {
-		dialogHeight := lipgloss.Height(dialog)
-		dialogWidth := lipgloss.Width(dialog)
-		topRow := (d.height - dialogHeight) / 2
-		leftCol := (d.width - dialogWidth) / 2
+		topRow, leftCol := dialogOrigin(d.width, d.height, lipgloss.Width(dialog), lipgloss.Height(dialog))
 
 		overlayRow := topRow + 1 + 2 + d.modelLineOffset
 		overlayCol := leftCol + 1 + 4

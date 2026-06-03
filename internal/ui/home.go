@@ -32,6 +32,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/git"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/safego"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/sysinfo"
@@ -978,6 +979,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		h.defaultFilter = cfg.Display.GetDefaultFilter()
 		h.activeFilterLabel = cfg.Display.ActiveFilterLabel
 		h.activeFilterExcludes = cfg.Display.GetActiveFilterExcludes()
+		tmux.SetHideCwdPrefixInTitle(!cfg.Display.GetIncludeCwdPrefix())
 		h.sysStatsConfig = cfg.SystemStats
 		h.costLineTemplate, h.costLineHideWhenZero = session.ResolveCostLineTemplate(cfg, actualProfile)
 		h.previewPct = cfg.UI.GetPreviewPct()
@@ -1795,10 +1797,14 @@ func (h *Home) syncViewport() {
 	if h.maintenanceMsg != "" {
 		maintenanceBannerHeight = 1
 	}
+	debugBarHeight := 0
+	if h.debugMode {
+		debugBarHeight = 1
+	}
 
 	// contentHeight = total height for main content area
-	// -1 for header line, -helpBarHeight for help bar, -updateBannerHeight, -maintenanceBannerHeight, -filterBarHeight
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight
+	// MUST match View(): subtract debugBarHeight when the debug footer is rendered.
+	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
 
 	// CRITICAL: Calculate panelContentHeight based on current layout mode
 	// This MUST match the calculations in renderStackedLayout/renderDualColumnLayout/renderSingleColumnLayout
@@ -1938,8 +1944,12 @@ func (h *Home) getVisibleHeight() int {
 	if h.maintenanceMsg != "" {
 		maintenanceBannerHeight = 1
 	}
+	debugBarHeight := 0
+	if h.debugMode {
+		debugBarHeight = 1
+	}
 
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight
+	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
 
 	var panelContentHeight int
 	layoutMode := h.getLayoutMode()
@@ -2461,6 +2471,7 @@ func (h *Home) pruneAnalyticsCache() {
 
 	// Prune MCP info cache (entries older than 10 minutes)
 	session.PruneMCPCache(maxAge)
+	session.PruneCursorMCPCache(maxAge)
 }
 
 // setError sets an error with timestamp for auto-dismiss
@@ -6671,11 +6682,11 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "m":
-		// MCP Manager - for Claude and Gemini sessions
+		// MCP Manager — Claude, Gemini, and Cursor Agent CLI
 		if h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeSession && item.Session != nil &&
-				(session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+				session.ToolSupportsMCPManager(item.Session.Tool) {
 				h.mcpDialog.SetSize(h.width, h.height)
 				if err := h.mcpDialog.Show(item.Session.ProjectPath, item.Session.ID, item.Session.Tool); err != nil {
 					h.setError(err)
@@ -7814,6 +7825,22 @@ func (h *Home) refreshWatcherPanel() {
 	}
 }
 
+// formatWatcherDispatchMsg builds the single line delivered into the conductor
+// pane for a routed watcher event. It prefers the full message Body (so the
+// conductor receives the complete text, not the first-line/200-byte Subject
+// label) and falls back to Subject when Body is empty (e.g. v1 events). Newlines
+// are collapsed to spaces because the delivery uses tmux send-keys, where a
+// literal '\n' is sent as Enter and would submit the line prematurely.
+func formatWatcherDispatchMsg(evt watcher.Event) string {
+	text := strings.TrimSpace(evt.Body)
+	if text == "" {
+		text = evt.Subject
+	}
+	text = strings.ReplaceAll(text, "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\n", " ")
+	return fmt.Sprintf("[%s] %s: %s", evt.Source, evt.Sender, text)
+}
+
 // dispatchWatcherEvent sends a routed watcher event into the conductor's tmux pane.
 // Skipped for triage and unrouted events (RoutedTo empty or "triage") since those have no
 // concrete delivery target yet. Mirrors dispatchHealthAlert: looks up the conductor session
@@ -7822,7 +7849,7 @@ func (h *Home) dispatchWatcherEvent(evt watcher.Event) {
 	if evt.RoutedTo == "" || evt.RoutedTo == "triage" || strings.HasPrefix(evt.RoutedTo, "triage-") {
 		return
 	}
-	msg := fmt.Sprintf("[%s] %s: %s", evt.Source, evt.Sender, evt.Subject)
+	msg := formatWatcherDispatchMsg(evt)
 	sessionTitle := session.ConductorSessionTitle(evt.RoutedTo)
 	h.instancesMu.RLock()
 	instances := h.instances
@@ -7836,9 +7863,8 @@ func (h *Home) dispatchWatcherEvent(evt watcher.Event) {
 			return
 		}
 		tmuxName := ts.Name
-		socket := inst.TmuxSocketName
 		go func() {
-			if err := tmux.Exec(socket, "send-keys", "-t", tmuxName, msg, "Enter").Run(); err != nil {
+			if err := deliverToConductorPane(ts, msg); err != nil {
 				uiLog.Warn("dispatch_watcher_event_send_failed",
 					slog.String("tmux_session", tmuxName),
 					slog.String("error", err.Error()))
@@ -7846,6 +7872,101 @@ func (h *Home) dispatchWatcherEvent(evt watcher.Event) {
 		}()
 		return
 	}
+}
+
+// deliverToConductorPane sends msg into a conductor's tmux pane and verifies it
+// was actually submitted, then returns. A raw single
+// `send-keys <msg> Enter` races the inner agent's input handler: tmux 3.2+ wraps the
+// literal text in bracketed-paste markers (\e[200~…\e[201~) and the trailing
+// Enter lands in the same PTY buffer as the paste-end marker, so async TUIs
+// (Ink/Node.js, curses, ratatui) can swallow it — the message is typed into the composer but never sent. That
+// is exactly how routed messages get silently dropped once this native
+// send-keys path is the sole delivery route (no external bridge).
+//
+// Two layers, agent-agnostic where possible:
+//   - SendKeysAndEnter separates the literal text from a delayed Enter, which
+//     fixes the paste/Enter race for any bracketed-paste TUI.
+//   - A verify loop confirms submission. The tool-agnostic signal is the
+//     session status flipping to "active" (the status detector handles both
+//     claude and codex), proving the agent accepted the input and began work.
+//     For an introspectable composer (claude's prompt marker) it additionally
+//     re-presses Enter while the message is still shown unsent and treats a
+//     cleared composer as submitted; agents without composer introspection get
+//     a small bounded number of fallback Enters in case the delayed Enter was
+//     dropped.
+//
+// Best-effort: returns an error only when no submission signal is seen within
+// the budget, so the caller can log the drop instead of failing silently.
+// Intended to run inside a goroutine.
+func deliverToConductorPane(p conductorPane, msg string) error {
+	return deliverToConductorPaneTuned(p, msg, 40, 250*time.Millisecond)
+}
+
+// conductorPane is the slice of *tmux.Session that reliable delivery needs.
+// Declaring it as an interface keeps the verify-retry loop unit-testable with a
+// fake pane (mirrors the sendRetryTarget interface used by the CLI send path).
+type conductorPane interface {
+	SendKeysAndEnter(string) error
+	SendEnter() error
+	CapturePaneFresh() (string, error)
+	GetStatus() (string, error)
+}
+
+// blindEnterCap bounds the fallback Enter presses for agents whose composer is
+// not introspectable, so a message that was actually delivered (and the agent
+// has since gone idle) is not spammed with empty submissions.
+const blindEnterCap = 3
+
+// deliverToConductorPaneTuned is deliverToConductorPane with the verify budget
+// exposed for tests; production callers use the default budget (~10s).
+func deliverToConductorPaneTuned(p conductorPane, msg string, maxChecks int, checkDelay time.Duration) error {
+	if err := p.SendKeysAndEnter(msg); err != nil {
+		return err
+	}
+	sawUnsent := false
+	blindEnters := 0
+	for i := 0; i < maxChecks; i++ {
+		if checkDelay > 0 {
+			time.Sleep(checkDelay)
+		}
+
+		// Tool-agnostic success: the status detector recognizes claude and codex
+		// "active", so a transition to active proves the Enter was accepted and
+		// the agent began processing the message.
+		if status, err := p.GetStatus(); err == nil && status == "active" {
+			return nil
+		}
+
+		raw, err := p.CapturePaneFresh()
+		if err != nil {
+			continue
+		}
+		content := tmux.StripANSI(raw)
+
+		switch {
+		case send.HasUnsentComposerPrompt(content, msg):
+			// Introspectable composer still holds the message: the trailing
+			// Enter was swallowed, so re-press it. Surface a tmux rejection
+			// immediately rather than letting it masquerade as a timeout.
+			sawUnsent = true
+			if err := p.SendEnter(); err != nil {
+				return fmt.Errorf("retry enter: %w", err)
+			}
+		case sawUnsent || send.HasCurrentComposerPrompt(content):
+			// The composer previously held the message and is now clear, or a
+			// composer is rendered without our message: submitted.
+			return nil
+		case blindEnters < blindEnterCap:
+			// No composer introspection (e.g. codex/cursor) and not yet active.
+			// Re-press Enter a bounded number of times in case the delayed Enter
+			// was dropped, then defer to the status signal above.
+			blindEnters++
+			if err := p.SendEnter(); err != nil {
+				return fmt.Errorf("retry enter: %w", err)
+			}
+		}
+	}
+	return fmt.Errorf("watcher dispatch not confirmed submitted (status never active, composer still pending) after %s", time.Duration(maxChecks)*checkDelay)
 }
 
 // dispatchHealthAlert sends a health alert message to the conductor session associated
@@ -7886,9 +8007,12 @@ func (h *Home) dispatchHealthAlert(state watcher.HealthState) {
 			ts := inst.GetTmuxSession()
 			if ts != nil && ts.Name != "" {
 				tmuxName := ts.Name
-				socket := inst.TmuxSocketName
 				go func() {
-					_ = tmux.Exec(socket, "send-keys", "-t", tmuxName, alertMsg, "Enter").Run()
+					if err := deliverToConductorPane(ts, alertMsg); err != nil {
+						uiLog.Warn("dispatch_health_alert_send_failed",
+							slog.String("tmux_session", tmuxName),
+							slog.String("error", err.Error()))
+					}
 				}()
 			}
 			break
@@ -10847,9 +10971,14 @@ func clampViewToViewport(content string, width, height int) string {
 		// terminal cell count. Any line that slips past upstream gates
 		// with a #️⃣ 0️⃣–9️⃣ *️⃣ glyph would otherwise overflow into the
 		// next row here — exactly @jennings's pane-content drift report.
-		if cellWidth(line) > width {
-			lines[i] = cellTruncate(line, width, "")
-		}
+		//
+		// Also PAD short lines to exactly width (not just truncate long
+		// ones): on incremental redraw a shorter line must overwrite the
+		// full previous row, else the terminal keeps the stale trailing
+		// glyphs — the iTerm2 "ghost line" artifact on session-list scroll
+		// (#607 row-offset drift). fitCellWidth does both, on cellWidth so
+		// this post-join clamp stays a true terminal-cell net.
+		lines[i] = fitCellWidth(line, width)
 	}
 
 	return strings.Join(lines, "\n")
@@ -11355,7 +11484,7 @@ func (h *Home) renderHelpBarMinimal() string {
 					contextKeys += " " + forkRendered
 				}
 			}
-			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
 				mcpRendered := renderKeys(mcpKey)
 				if mcpRendered != "" {
 					contextKeys += " " + mcpRendered
@@ -11455,7 +11584,7 @@ func (h *Home) renderHelpBarCompact() string {
 					contextHints = append(contextHints, h.helpKeyShort(key, "Fork"))
 				}
 			}
-			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
 				if key := h.actionKey(hotkeyMCPManager); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, "MCP"))
 				}
@@ -11634,7 +11763,7 @@ func (h *Home) renderHelpBarFull() string {
 				}
 			}
 			// Show MCP Manager and preview mode toggle for Claude and Gemini sessions
-			if item.Session != nil && (session.IsClaudeCompatible(item.Session.Tool) || item.Session.Tool == "gemini") {
+			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
 				if mcpKey != "" {
 					primaryHints = append(primaryHints, h.helpKey(mcpKey, "MCP"))
 				}
@@ -11893,7 +12022,7 @@ func (h *Home) renderSessionList(width, height int) string {
 		if h.jumpMode && i < len(jumpHints) {
 			// Render item to temp buffer, then overlay hint badge at name position
 			var itemBuf strings.Builder
-			h.renderItem(&itemBuf, item, i == h.cursor, i, groupStats, snapshot)
+			h.renderItem(&itemBuf, item, i == h.cursor, i, groupStats, snapshot, width)
 			raw := itemBuf.String()
 			hint := jumpHints[i]
 			isMatch := h.jumpBuffer == "" || strings.HasPrefix(hint, h.jumpBuffer)
@@ -11913,7 +12042,7 @@ func (h *Home) renderSessionList(width, height int) string {
 				b.WriteString(raw)
 			}
 		} else {
-			h.renderItem(&b, item, i == h.cursor, i, groupStats, snapshot)
+			h.renderItem(&b, item, i == h.cursor, i, groupStats, snapshot, width)
 		}
 		visibleCount++
 	}
@@ -11991,6 +12120,7 @@ func (h *Home) renderItem(
 	itemIndex int,
 	groupStats map[string]groupRenderStats,
 	snapshot map[string]sessionRenderState,
+	listWidth int,
 ) {
 	switch item.Type {
 	case session.ItemTypeGroup:
@@ -11999,7 +12129,7 @@ func (h *Home) renderItem(
 		if item.CreatingID != "" {
 			h.renderCreatingSessionItem(b, item, selected)
 		} else {
-			h.renderSessionItem(b, item, selected, snapshot)
+			h.renderSessionItem(b, item, selected, snapshot, listWidth)
 		}
 	case session.ItemTypeWindow:
 		h.renderWindowItem(b, item, selected)
@@ -12182,6 +12312,7 @@ func (h *Home) renderSessionItem(
 	item session.Item,
 	selected bool,
 	snapshot map[string]sessionRenderState,
+	listWidth int,
 ) {
 	inst := item.Session
 
@@ -12414,7 +12545,11 @@ func (h *Home) renderSessionItem(
 	// the panel and shove subsequent rows down by one cell. See
 	// internal/ui/cellwidth.go for the upstream disagreement.
 	if selected && instState.paneTitle != "" {
-		remaining := h.width - cellWidth(row) - 2 // -2 for trailing margin
+		// Dual layout: sidebar is narrower than h.width (#937). Using full
+		// terminal width here overflows the SESSIONS pane, then lipgloss
+		// truncation disagrees from terminal cells — wrapped lines duplicate
+		// rows visually and mouseY→item indexing breaks until scroll settles.
+		remaining := listWidth - cellWidth(row) - 2 // -2 for trailing margin
 		if remaining > 10 {
 			pt := instState.paneTitle
 			if cellWidth(pt) > remaining {
@@ -13490,6 +13625,23 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString("\n")
 			renderLaunchModelInfoLines(&b, selected)
 		}
+	}
+
+	// Cursor Agent CLI — MCP configuration for `cursor agent`
+	if selected.Tool == "cursor" {
+		cursorHeader := renderSectionDivider("Cursor", width-4)
+		b.WriteString(cursorHeader)
+		b.WriteString("\n")
+
+		labelStyle := lipgloss.NewStyle().Foreground(ColorText)
+		valueStyle := lipgloss.NewStyle().Foreground(ColorText)
+		b.WriteString(labelStyle.Render("Tool:    "))
+		b.WriteString(valueStyle.Render("Cursor Agent CLI"))
+		b.WriteString("\n")
+		renderLaunchModelInfoLines(&b, selected)
+
+		mcpInfo := selected.GetMCPInfo()
+		renderSimpleMCPLine(&b, mcpInfo, width)
 	}
 
 	// OpenCode-specific info (session ID)
