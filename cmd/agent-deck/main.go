@@ -360,6 +360,9 @@ func main() {
 		case "debug-dump":
 			handleDebugDump()
 			return
+		case "completions":
+			handleCompletions(args[1:])
+			return
 		}
 	}
 
@@ -2970,6 +2973,7 @@ func printHelp() {
 	fmt.Println("  telegram-doctor  Audit channel-owning sessions for telegram drops (#1138)")
 	fmt.Println("  profile          Manage profiles")
 	fmt.Println("  update           Check for and install updates")
+	fmt.Println("  completions      Generate shell completion scripts")
 	fmt.Println("  debug-dump       Dump debug ring buffer to file for sharing")
 	fmt.Println("  uninstall        Uninstall Agent Deck")
 	fmt.Println("  version          Show version")
